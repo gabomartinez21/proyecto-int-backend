@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from app.database import get_db
 from app.deps import get_current_user
 from app.models import Pedido, PedidoItem, User
+from app.schemas import PedidoCreate, PedidoStatusUpdate
 
 router = APIRouter(prefix="/api/pedidos", tags=["pedidos"])
 

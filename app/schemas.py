@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, date
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models import TipoMovimiento, UnidadMedida, UserRole
@@ -86,11 +86,23 @@ class PedidoItemCreate(BaseModel):
     quantity: int
 
 class PedidoCreate(BaseModel):
-    customer: str
+    customer: str = Field(min_length=3, max_length=150)
     date: str
     channel: str
     notes: str = ""
     items: list[PedidoItemCreate]
+
+    @field_validator("date")
+    @classmethod
+    def validar_fecha(cls, v: str) -> str:
+        # Verifica que la fecha no sea antigua
+        try:
+            fecha_pedido = datetime.strptime(v, "%Y-%m-%d").date()
+            if fecha_pedido < date.today():
+                raise ValueError("La fecha de entrega no puede ser anterior a hoy.")
+        except ValueError as e:
+            raise ValueError(str(e) if "hoy" in str(e) else "Formato de fecha inválido")
+        return v
 
 class PedidoStatusUpdate(BaseModel):
     status: str
