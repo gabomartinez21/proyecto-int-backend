@@ -8,6 +8,7 @@ from app.database import get_db
 from app.deps import get_current_user, require_owner
 from app.models import Insumo, MovimientoStock, TipoMovimiento, User
 from app.schemas import InsumoCreate, InsumoOut, MovimientoOut, StockMovementCreate
+from app.stock import stock_reservado
 
 router = APIRouter(prefix="/api/insumos", tags=["insumos"])
 
@@ -73,6 +74,14 @@ def actualizar_stock(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail="No hay stock suficiente para esta salida",
         )
+
+    if payload.kind == TipoMovimiento.salida:
+        reservado = stock_reservado(db).get(insumo.id, 0.0)
+        if round(nuevo_stock - reservado, 6) < 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No puedes retirar stock reservado para pedidos.",
+            )
 
     insumo.stock = nuevo_stock
     mov = MovimientoStock(

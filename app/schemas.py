@@ -1,7 +1,7 @@
 from datetime import datetime, date
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models import TipoMovimiento, UnidadMedida, UserRole
+from app.models import CategoriaProducto, TipoMovimiento, UnidadMedida, UserRole
 
 
 class UserCreate(BaseModel):
@@ -79,17 +79,59 @@ class MovimientoOut(BaseModel):
     date: datetime
 
 
-from typing import Any
+# --- Schemas de Productos y Recetas ---
+
+class ProductoCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=150)
+    category: CategoriaProducto
+    price: float = Field(ge=0, le=1e9)
+    description: str = Field(default="", max_length=500)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("El nombre del producto es obligatorio")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def clean_description(cls, v: str) -> str:
+        return v.strip()
+
+
+class RecetaItemIn(BaseModel):
+    ingredientId: int
+    quantity: float = Field(gt=0, le=1e9)
+
+
+class RecetaUpdate(BaseModel):
+    recipe: list[RecetaItemIn]
+
+
+class ProductoOut(BaseModel):
+    id: int
+    name: str
+    category: CategoriaProducto
+    price: float
+    description: str
+    recipe: list[RecetaItemIn]
+
+
+# --- Schemas de Pedidos ---
 
 class PedidoItemCreate(BaseModel):
-    productId: str
-    quantity: int
+    # int en modo lax de Pydantic: acepta 5 y también "5".
+    productId: int
+    quantity: int = Field(ge=1, le=10_000)
+
 
 class PedidoCreate(BaseModel):
     customer: str = Field(min_length=3, max_length=150)
     date: str
     channel: str
-    notes: str = ""
+    notes: str = Field(default="", max_length=500)
     items: list[PedidoItemCreate]
 
     @field_validator("date")
