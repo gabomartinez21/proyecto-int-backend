@@ -1,8 +1,7 @@
 from datetime import datetime, date
-from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models import TipoMovimiento, UnidadMedida, UserRole
+from app.models import CategoriaProducto, TipoMovimiento, UnidadMedida, UserRole
 
 
 class UserCreate(BaseModel):
@@ -80,19 +79,67 @@ class MovimientoOut(BaseModel):
     date: datetime
 
 
-# --- Schemas de Pedidos (HU009 - HU014) ---
+# --- Schemas de Productos y Recetas (HU001 - HU004) ---
+
+class ProductoCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=150)
+    category: CategoriaProducto
+    price: float = Field(ge=0, le=1e9)
+    description: str = Field(default="", max_length=500)
+
+    @field_validator("name")
+    @classmethod
+    def clean_name(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("El nombre del producto es obligatorio")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def clean_description(cls, v: str) -> str:
+        return v.strip()
+
+
+class RecetaItemIn(BaseModel):
+    ingredientId: int
+    quantity: float = Field(gt=0, le=1e9)
+
+
+class RecetaUpdate(BaseModel):
+    recipe: list[RecetaItemIn]
+
+
+class ProductoOut(BaseModel):
+    id: int
+    name: str
+    category: CategoriaProducto
+    price: float
+    description: str
+    recipe: list[RecetaItemIn]
+
+
+# --- Schemas de Pedidos (Sprint 2 y Sprint 3: HU009 - HU017) ---
 
 class PedidoItemCreate(BaseModel):
-    productId: str
-    quantity: int = Field(gt=0)
+    productId: int
+    quantity: int = Field(ge=1, le=10_000)
 
 
 class PedidoCreate(BaseModel):
-    customer: str = Field(min_length=3, max_length=150)
+    customer: str = Field(min_length=1, max_length=150)
     date: str
     channel: str
-    notes: str = ""
+    notes: str = Field(default="", max_length=500)
     items: list[PedidoItemCreate]
+
+    @field_validator("customer")
+    @classmethod
+    def clean_customer(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("El cliente es obligatorio")
+        return v
 
     @field_validator("date")
     @classmethod
@@ -104,26 +151,21 @@ class PedidoCreate(BaseModel):
         except ValueError as e:
             raise ValueError(str(e) if "hoy" in str(e) else "Formato de fecha inválido")
         return v
+
+
+class PedidoUpdate(PedidoCreate):
+    """HU013: Editar pedido antes de preparación."""
+    pass
 
 
 class PedidoStatusUpdate(BaseModel):
     status: str
 
 
-class PedidoUpdate(BaseModel):
-    customer: str = Field(min_length=3, max_length=150)
-    date: str
-    channel: str
-    notes: str = ""
-    items: list[PedidoItemCreate]
+# --- Schemas de Compras (Sprint 3: HU021, HU023) ---
 
-    @field_validator("date")
-    @classmethod
-    def validar_fecha(cls, v: str) -> str:
-        try:
-            fecha_pedido = datetime.strptime(v, "%Y-%m-%d").date()
-            if fecha_pedido < date.today():
-                raise ValueError("La fecha de entrega no puede ser anterior a hoy.")
-        except ValueError as e:
-            raise ValueError(str(e) if "hoy" in str(e) else "Formato de fecha inválido")
-        return v
+class CompraConfirmarItem(BaseModel):
+    """HU023: Ingreso rápido de insumos comprados."""
+    insumo_id: int
+    quantity: float = Field(gt=0, le=1e9)
+    note: str = Field(default="Compra desde lista semanal", max_length=150)

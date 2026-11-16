@@ -1,8 +1,8 @@
 import enum
 from datetime import datetime, timezone
 
-from sqlalchemy import DateTime, Enum, Float, ForeignKey, String
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import DateTime, Enum, Float, ForeignKey, String, Text, UniqueConstraint
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
@@ -21,6 +21,13 @@ class UnidadMedida(str, enum.Enum):
 class TipoMovimiento(str, enum.Enum):
     entrada = "entrada"
     salida = "salida"
+
+
+class CategoriaProducto(str, enum.Enum):
+    viandas = "Viandas"
+    postres = "Postres"
+    eventos = "Eventos"
+    otros = "Otros"
 
 
 class User(Base):
@@ -73,6 +80,11 @@ class Pedido(Base):
     status: Mapped[str] = mapped_column(String(50), default="Pendiente")
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
 
+    items: Mapped[list["PedidoItem"]] = relationship(
+        cascade="all, delete-orphan", order_by="PedidoItem.id"
+    )
+
+
 class PedidoItem(Base):
     __tablename__ = "pedido_items"
 
@@ -82,5 +94,37 @@ class PedidoItem(Base):
     name: Mapped[str] = mapped_column(String(150))
     price: Mapped[float] = mapped_column(Float)
     quantity: Mapped[int] = mapped_column()
-    # Se guarda como JSON porque la receta puede cambiar en el futuro, pero el pedido mantiene la que tenía
-    recipe: Mapped[str] = mapped_column(String(1000))
+    # Copia JSON [{ingredientId, quantity}] de la receta al momento de crear el pedido:
+    # si luego cambia la receta del producto, el pedido conserva la que tenía.
+    recipe: Mapped[str] = mapped_column(Text)
+
+
+class Producto(Base):
+    __tablename__ = "productos"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    # La unicidad sin distinguir mayúsculas se valida en el router (func.lower).
+    name: Mapped[str] = mapped_column(String(150), unique=True, index=True)
+    category: Mapped[CategoriaProducto] = mapped_column(
+        Enum(
+            CategoriaProducto,
+            name="categoria_producto",
+            values_callable=lambda e: [m.value for m in e],
+        )
+    )
+    price: Mapped[float] = mapped_column(Float, default=0.0)
+    description: Mapped[str] = mapped_column(String(500), default="")
+
+    recipe: Mapped[list["RecetaItem"]] = relationship(
+        cascade="all, delete-orphan", order_by="RecetaItem.id"
+    )
+
+
+class RecetaItem(Base):
+    __tablename__ = "receta_items"
+    __table_args__ = (UniqueConstraint("producto_id", "insumo_id", name="uq_receta_producto_insumo"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    producto_id: Mapped[int] = mapped_column(ForeignKey("productos.id", ondelete="CASCADE"))
+    insumo_id: Mapped[int] = mapped_column(ForeignKey("insumos.id"))
+    quantity: Mapped[float] = mapped_column(Float)
