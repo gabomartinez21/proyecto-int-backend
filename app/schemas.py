@@ -173,6 +173,10 @@ class PedidoUpdate(_PedidoBase):
 
 class PedidoStatusUpdate(BaseModel):
     status: str
+    # HU012: obligatorio al marcar Entregado (receptor confirmado)
+    receiver: str | None = Field(default=None, max_length=150)
+    # HU012: obligatorio al marcar Entregado (receptor confirmado)
+    receiver: str | None = Field(default=None, max_length=150)
 
 
 # --- Schemas de Compras (Sprint 3: HU021, HU023) ---

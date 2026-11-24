@@ -2,7 +2,7 @@ from datetime import date, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import select, and_, or_
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
@@ -35,7 +35,10 @@ def generar_lista_semanal(
         select(Pedido)
         .options(selectinload(Pedido.items))
         .where(
-            Pedido.status.in_(["Pendiente", ESTADO_CONFIRMADO]),
+            or_(
+                Pedido.status == ESTADO_CONFIRMADO,
+                and_(Pedido.status == "Pendiente de pago", Pedido.payment_status == "Validado"),
+            ),
             Pedido.date >= fecha_inicio,
             Pedido.date <= fecha_fin,
         )

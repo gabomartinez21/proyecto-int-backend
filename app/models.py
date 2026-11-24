@@ -77,8 +77,17 @@ class Pedido(Base):
     date: Mapped[str] = mapped_column(String(20))
     channel: Mapped[str] = mapped_column(String(50))
     notes: Mapped[str] = mapped_column(String(500), default="")
-    status: Mapped[str] = mapped_column(String(50), default="Pendiente")
+    status: Mapped[str] = mapped_column(String(50), default="Pendiente de pago")
     created: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
+    # HU024: validación de pago (solo la dueña)
+    payment_status: Mapped[str] = mapped_column(String(20), default="Pendiente")
+    operation_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    payment_proof_url: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    payment_validated_by: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    payment_validated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # HU012: datos de entrega
+    delivered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    delivery_receiver: Mapped[str | None] = mapped_column(String(150), nullable=True)
 
     items: Mapped[list["PedidoItem"]] = relationship(
         cascade="all, delete-orphan", order_by="PedidoItem.id"

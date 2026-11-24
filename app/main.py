@@ -6,12 +6,14 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import models  # noqa: F401
 from app.core.config import settings
 from app.database import Base, engine
+from app.migrations import migrate
 from app.routers import auth, compras, insumos, pedidos, productos
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     Base.metadata.create_all(bind=engine)
+    migrate(engine)
     yield
 
 

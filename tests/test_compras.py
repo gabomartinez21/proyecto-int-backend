@@ -3,8 +3,13 @@ from datetime import date, timedelta
 from tests.test_pedidos import cambiar_estado, catalogo, crear_pedido, employee_headers, owner_headers  # noqa: F401
 
 
-def test_lista_semanal_calcula_faltantes_y_presupuesto(client, employee_headers, catalogo):
-    crear_pedido(client, employee_headers, catalogo["torta"]["id"], quantity=6)  # 12 kg, hay 10
+def test_lista_semanal_calcula_faltantes_y_presupuesto(client, employee_headers, owner_headers, catalogo):
+    pedido = crear_pedido(client, employee_headers, catalogo["torta"]["id"], quantity=6)  # 12 kg, hay 10
+    # Pago validado pero sin stock suficiente: sigue pendiente y genera necesidad de compra (HU021).
+    pago = client.patch(
+        f"/api/pedidos/{pedido['id']}/validar-pago", data={"codigo_operacion": "OP-1"}, headers=owner_headers
+    )
+    assert pago.status_code == 409
     res = client.get("/api/compras/lista-semanal", headers=employee_headers)
     assert res.status_code == 200, res.text
     data = res.json()

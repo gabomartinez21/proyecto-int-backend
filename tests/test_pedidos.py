@@ -6,7 +6,8 @@ import pytest
 @pytest.fixture()
 def owner_headers(register_user, login):
     register_user("duena")
-    return {"Authorization": f"Bearer {login('duena')}"}
+    OWNER["h"] = {"Authorization": f"Bearer {login('duena')}"}
+    return OWNER["h"]
 
 
 @pytest.fixture()
@@ -47,8 +48,18 @@ def crear_pedido(client, headers, product_id, quantity=1):
     return res.json()
 
 
+OWNER = {}
+
+
 def cambiar_estado(client, headers, pedido_id, estado):
-    return client.put(f"/api/pedidos/{pedido_id}/estado", json={"status": estado}, headers=headers)
+    if estado == "Confirmado":
+        # HU024: solo la dueña valida el pago; con stock suficiente se confirma y reserva.
+        return client.patch(
+            f"/api/pedidos/{pedido_id}/validar-pago", data={"codigo_operacion": "OP-123"}, headers=OWNER["h"]
+        )
+    return client.put(
+        f"/api/pedidos/{pedido_id}/estado", json={"status": estado, "receiver": "Ana Torres"}, headers=headers
+    )
 
 
 def stock_harina(client, headers, harina_id):
@@ -61,7 +72,7 @@ def test_crear_pedido_copia_datos_del_producto(client, employee_headers, catalog
     pedido = crear_pedido(client, employee_headers, str(torta["id"]), quantity=2)
 
     assert pedido["number"] == 1
-    assert pedido["status"] == "Pendiente"
+    assert pedido["status"] == "Pendiente de pago"
     assert pedido["items"] == [
         {
             "productId": torta["id"],
@@ -113,7 +124,7 @@ def test_transiciones_no_permitidas(client, employee_headers, catalogo):
 
     assert cambiar_estado(client, employee_headers, pedido["id"], "Cancelado").status_code == 200
     res = cambiar_estado(client, employee_headers, pedido["id"], "Confirmado")
-    assert res.json()["detail"] == "Cambio de estado no permitido."
+    assert res.status_code == 400
 
     assert cambiar_estado(client, employee_headers, pedido["id"], "Inventado").status_code == 400
     assert cambiar_estado(client, employee_headers, 999, "Confirmado").status_code == 404
@@ -129,30 +140,31 @@ def test_confirmar_respeta_lo_reservado_por_otros_pedidos(client, employee_heade
     assert res.json()["status"] == "Confirmado"
 
     res = cambiar_estado(client, employee_headers, p2["id"], "Confirmado")
-    assert res.status_code == 400
-    assert res.json()["detail"] == "Stock insuficiente: Harina. Revisa la lista de compras."
+    assert res.status_code == 409
+    assert res.json()["detail"]["pagoValidado"] is True
+    assert res.json()["detail"]["faltantes"][0]["nombre"] == "Harina"
 
     # Al cancelar p1 se libera la reserva
     cambiar_estado(client, employee_headers, p1["id"], "Cancelado")
     assert cambiar_estado(client, employee_headers, p2["id"], "Confirmado").status_code == 200
 
 
-def test_entregar_descuenta_stock_y_registra_movimiento(client, employee_headers, owner_headers, catalogo):
+def test_preparar_descuenta_stock_y_registra_movimiento(client, employee_headers, owner_headers, catalogo):
     harina_id = catalogo["harina"]["id"]
     pedido = crear_pedido(client, employee_headers, catalogo["torta"]["id"], quantity=2)
     cambiar_estado(client, employee_headers, pedido["id"], "Confirmado")
 
-    res = cambiar_estado(client, employee_headers, pedido["id"], "Entregado")
+    res = cambiar_estado(client, employee_headers, pedido["id"], "En preparación")
     assert res.status_code == 200, res.text
-    assert res.json()["status"] == "Entregado"
+    assert res.json()["status"] == "En preparación"
     assert stock_harina(client, owner_headers, harina_id) == 6.0
 
     mov = client.get("/api/insumos/movimientos", headers=owner_headers).json()[0]
     assert mov["insumo_id"] == harina_id
     assert mov["quantity"] == -4.0
-    assert mov["note"] == f"Entrega de pedido #{pedido['number']}"
+    assert mov["note"] == f"Preparación de pedido #{pedido['number']}"
 
-    # Un pedido entregado ya no reserva stock
+    # Un pedido en preparación ya no reserva stock
     res = client.post(
         f"/api/insumos/{harina_id}/stock",
         json={"kind": "salida", "quantity": 6, "note": "Merma"},
@@ -161,7 +173,7 @@ def test_entregar_descuenta_stock_y_registra_movimiento(client, employee_headers
     assert res.status_code == 200
 
 
-def test_entregar_sin_stock_no_modifica_nada(client, employee_headers, owner_headers, catalogo, db):
+def test_preparar_sin_stock_no_modifica_nada(client, employee_headers, owner_headers, catalogo, db):
     from app.models import Insumo
 
     harina_id = catalogo["harina"]["id"]
@@ -172,14 +184,14 @@ def test_entregar_sin_stock_no_modifica_nada(client, employee_headers, owner_hea
     db.get(Insumo, harina_id).stock = 5.0
     db.commit()
 
-    res = cambiar_estado(client, employee_headers, pedido["id"], "Entregado")
+    res = cambiar_estado(client, employee_headers, pedido["id"], "En preparación")
     assert res.status_code == 400
     assert res.json()["detail"] == "Stock insuficiente."
     assert stock_harina(client, owner_headers, harina_id) == 5.0
     estado = next(p for p in client.get("/api/pedidos", headers=owner_headers).json() if p["id"] == pedido["id"])
     assert estado["status"] == "Confirmado"
     notas = [m["note"] for m in client.get("/api/insumos/movimientos", headers=owner_headers).json()]
-    assert not any(n.startswith("Entrega de pedido") for n in notas)
+    assert not any(n.startswith("Preparación de pedido") for n in notas)
 
 
 def test_no_se_puede_retirar_stock_reservado(client, employee_headers, owner_headers, catalogo):
@@ -261,3 +273,57 @@ def test_validar_stock_reporta_faltantes(client, employee_headers, catalogo):
     assert res.status_code == 409
     faltante = res.json()["detail"]["faltantes"][0]
     assert (faltante["requerido"], faltante["disponible"], faltante["faltante"]) == (12, 10, 2)
+
+
+def test_flujo_completo_con_pago_validado(client, employee_headers, owner_headers, catalogo):
+    pedido = crear_pedido(client, employee_headers, catalogo["torta"]["id"])
+    assert pedido["paymentStatus"] == "Pendiente"
+    # Empleado no puede validar pago
+    res = client.patch(f"/api/pedidos/{pedido['id']}/validar-pago", data={"codigo_operacion": "X1"}, headers=employee_headers)
+    assert res.status_code == 403
+    # Sin evidencia
+    res = client.patch(f"/api/pedidos/{pedido['id']}/validar-pago", headers=owner_headers)
+    assert res.status_code == 400
+    # No se confirma sin pago validado
+    res = client.put(f"/api/pedidos/{pedido['id']}/estado", json={"status": "Confirmado"}, headers=employee_headers)
+    assert res.status_code == 400
+    res = client.patch(f"/api/pedidos/{pedido['id']}/validar-pago", data={"codigo_operacion": "OP-9"}, headers=owner_headers)
+    assert res.status_code == 200, res.text
+    body = res.json()
+    assert body["status"] == "Confirmado" and body["paymentStatus"] == "Validado"
+    assert body["paymentValidatedBy"] == "duena" and body["operationCode"] == "OP-9"
+    for estado in ("En preparación", "Listo para entrega"):
+        res = client.put(f"/api/pedidos/{pedido['id']}/estado", json={"status": estado}, headers=employee_headers)
+        assert res.status_code == 200, res.text
+    # Entregado exige receptor
+    res = client.put(f"/api/pedidos/{pedido['id']}/estado", json={"status": "Entregado"}, headers=employee_headers)
+    assert res.status_code == 400
+    res = client.put(f"/api/pedidos/{pedido['id']}/estado", json={"status": "Entregado", "receiver": "Ana"}, headers=employee_headers)
+    assert res.status_code == 200 and res.json()["deliveryReceiver"] == "Ana"
+    # Repetir no duplica movimientos
+    assert client.put(f"/api/pedidos/{pedido['id']}/estado", json={"status": "En preparación"}, headers=employee_headers).status_code == 400
+
+
+def test_validar_pago_comprobante_invalido(client, employee_headers, owner_headers, catalogo, tmp_path, monkeypatch):
+    from app.routers import pedidos as router_pedidos
+
+    monkeypatch.setattr(router_pedidos, "COMPROBANTES_DIR", tmp_path)
+    pedido = crear_pedido(client, employee_headers, catalogo["torta"]["id"])
+    url = f"/api/pedidos/{pedido['id']}/validar-pago"
+    res = client.patch(url, files={"comprobante": ("a.pdf", b"%PDF", "application/pdf")}, headers=owner_headers)
+    assert res.status_code == 400
+    grande = b"\x89PNG" + b"0" * (5 * 1024 * 1024)
+    res = client.patch(url, files={"comprobante": ("a.png", grande, "image/png")}, headers=owner_headers)
+    assert res.status_code == 400
+    res = client.patch(url, files={"comprobante": ("a.png", b"\x89PNG....", "image/png")}, headers=owner_headers)
+    assert res.status_code == 200, res.text
+    assert res.json()["paymentProofUrl"].startswith("uploads/comprobantes/")
+
+
+def test_validar_pago_sin_stock_deja_pago_validado(client, employee_headers, owner_headers, catalogo):
+    pedido = crear_pedido(client, employee_headers, catalogo["torta"]["id"], quantity=6)  # 12 kg > 10
+    res = client.patch(f"/api/pedidos/{pedido['id']}/validar-pago", data={"codigo_operacion": "OP-1"}, headers=owner_headers)
+    assert res.status_code == 409
+    assert res.json()["detail"]["faltantes"][0]["faltante"] == 2.0
+    actual = next(p for p in client.get("/api/pedidos", headers=owner_headers).json() if p["id"] == pedido["id"])
+    assert actual["status"] == "Pendiente de pago" and actual["paymentStatus"] == "Validado"

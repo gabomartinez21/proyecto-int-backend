@@ -1,13 +1,15 @@
 import json
-from datetime import date
+import uuid
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
 
 from app.database import get_db
-from app.deps import get_current_user
+from app.deps import get_current_user, require_owner
 from app.models import Insumo, MovimientoStock, Pedido, PedidoItem, Producto, User
 from app.schemas import PedidoCreate, PedidoStatusUpdate, PedidoUpdate
 from app.stock import ESTADO_CONFIRMADO, necesidades, stock_reservado
@@ -15,15 +17,26 @@ from app.stock import ESTADO_CONFIRMADO, necesidades, stock_reservado
 router = APIRouter(prefix="/api/pedidos", tags=["pedidos"])
 
 CANALES = ["WhatsApp", "Instagram", "Directo"]
-ESTADO_PENDIENTE = "Pendiente"
+ESTADO_PENDIENTE = "Pendiente de pago"
+ESTADO_EN_PREPARACION = "En preparación"
+ESTADO_LISTO = "Listo para entrega"
 ESTADO_ENTREGADO = "Entregado"
 ESTADO_CANCELADO = "Cancelado"
-ESTADOS = [ESTADO_PENDIENTE, ESTADO_CONFIRMADO, ESTADO_ENTREGADO, ESTADO_CANCELADO]
+ESTADOS = [
+    ESTADO_PENDIENTE, ESTADO_CONFIRMADO, ESTADO_EN_PREPARACION,
+    ESTADO_LISTO, ESTADO_ENTREGADO, ESTADO_CANCELADO,
+]
 TRANSICIONES: dict[str, set[str]] = {
     ESTADO_PENDIENTE: {ESTADO_CONFIRMADO, ESTADO_CANCELADO},
-    ESTADO_CONFIRMADO: {ESTADO_ENTREGADO, ESTADO_CANCELADO},
+    ESTADO_CONFIRMADO: {ESTADO_EN_PREPARACION, ESTADO_CANCELADO},
+    ESTADO_EN_PREPARACION: {ESTADO_LISTO},
+    ESTADO_LISTO: {ESTADO_ENTREGADO},
 }
 EDITABLES = {ESTADO_PENDIENTE, ESTADO_CONFIRMADO}
+PAGO_VALIDADO = "Validado"
+MAX_COMPROBANTE_BYTES = 5 * 1024 * 1024
+COMPROBANTES_DIR = Path("uploads/comprobantes")
+TIPOS_COMPROBANTE = {"image/jpeg": (".jpg", b"\xff\xd8"), "image/png": (".png", b"\x89PNG")}
 
 
 def _bad_request(detail: str) -> HTTPException:
@@ -45,6 +58,13 @@ def _serializar(pedido: Pedido) -> dict:
         "notes": pedido.notes,
         "status": pedido.status,
         "created": pedido.created.isoformat(),
+        "paymentStatus": pedido.payment_status,
+        "operationCode": pedido.operation_code,
+        "paymentProofUrl": pedido.payment_proof_url,
+        "paymentValidatedBy": pedido.payment_validated_by,
+        "paymentValidatedAt": pedido.payment_validated_at.isoformat() if pedido.payment_validated_at else None,
+        "deliveredAt": pedido.delivered_at.isoformat() if pedido.delivered_at else None,
+        "deliveryReceiver": pedido.delivery_receiver,
         "items": [
             {
                 "productId": _product_id_out(i.product_id),
@@ -148,8 +168,8 @@ def _confirmar(
             raise _bad_request(mensaje.format(nombre=nombre))
 
 
-def _entregar(db: Session, pedido: Pedido) -> None:
-    """Descuenta el stock y registra los movimientos. Todo o nada."""
+def _preparar(db: Session, pedido: Pedido) -> None:
+    """HU016: al pasar a En preparación descuenta En Almacén (la reserva se libera sola al dejar Confirmado)."""
     necesario = necesidades(pedido.items)
     if not necesario:
         return
@@ -172,7 +192,7 @@ def _entregar(db: Session, pedido: Pedido) -> None:
                 ingredient=insumo.name,
                 quantity=-cantidad,
                 unit=insumo.unit.value,
-                note=f"Entrega de pedido #{pedido.number}",
+                note=f"Preparación de pedido #{pedido.number}",
             )
         )
 
@@ -193,7 +213,7 @@ def cambiar_estado(
     db: Annotated[Session, Depends(get_db)],
     _: Annotated[User, Depends(get_current_user)],
 ):
-    """HU012, HU014 y HU016: Cambiar estado, reservar, descontar o cancelar liberando reservas."""
+    """HU012, HU014 y HU016: avanzar estado; reservar al confirmar, descontar al preparar."""
     pedido = _obtener_para_actualizar(db, pedido_id)
 
     nuevo = payload.status
@@ -204,11 +224,88 @@ def cambiar_estado(
 
     try:
         if nuevo == ESTADO_CONFIRMADO:
+            if pedido.payment_status != PAGO_VALIDADO:
+                raise _bad_request("El pago debe ser validado por la dueña (HU024) antes de confirmar.")
             _confirmar(db, pedido)
+        elif nuevo == ESTADO_EN_PREPARACION:
+            _preparar(db, pedido)
         elif nuevo == ESTADO_ENTREGADO:
-            _entregar(db, pedido)
+            receptor = (payload.receiver or "").strip()
+            if not receptor:
+                raise _bad_request("Para marcar Entregado indica quién recibió el pedido.")
+            pedido.delivery_receiver = receptor
+            pedido.delivered_at = datetime.now(timezone.utc)
         pedido.status = nuevo
         db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+    db.refresh(pedido)
+    return _serializar(pedido)
+
+
+@router.patch("/{pedido_id}/validar-pago")
+def validar_pago(
+    pedido_id: int,
+    db: Annotated[Session, Depends(get_db)],
+    owner: Annotated[User, Depends(require_owner)],
+    codigo_operacion: Annotated[str | None, Form()] = None,
+    comprobante: Annotated[UploadFile | None, File()] = None,
+):
+    """HU024: la dueña valida el pago (JPG/PNG <= 5 MB o código) y, con stock suficiente, confirma y reserva."""
+    pedido = _obtener_para_actualizar(db, pedido_id)
+    if pedido.status != ESTADO_PENDIENTE:
+        raise _bad_request("Solo se puede validar el pago de un pedido Pendiente de pago.")
+
+    codigo = (codigo_operacion or "").strip() or None
+    if comprobante is not None and not comprobante.filename:
+        comprobante = None
+    ya_validado = pedido.payment_status == PAGO_VALIDADO
+
+    guardar: tuple[str, bytes] | None = None
+    if not ya_validado:
+        if comprobante is None and not codigo:
+            raise _bad_request("Adjunta un comprobante (JPG/PNG) o ingresa el código de operación.")
+        if comprobante is not None:
+            tipo = TIPOS_COMPROBANTE.get(comprobante.content_type or "")
+            if tipo is None:
+                raise _bad_request("Formato no permitido: el comprobante debe ser JPG o PNG.")
+            data = comprobante.file.read(MAX_COMPROBANTE_BYTES + 1)
+            if len(data) > MAX_COMPROBANTE_BYTES:
+                raise _bad_request("El comprobante supera el máximo de 5 MB.")
+            if not data.startswith(tipo[1]):
+                raise _bad_request("El archivo no es una imagen JPG/PNG válida.")
+            guardar = (tipo[0], data)
+
+    try:
+        if not ya_validado:
+            if guardar is not None:
+                COMPROBANTES_DIR.mkdir(parents=True, exist_ok=True)
+                nombre = f"pedido-{pedido.id}-{uuid.uuid4().hex}{guardar[0]}"
+                (COMPROBANTES_DIR / nombre).write_bytes(guardar[1])
+                pedido.payment_proof_url = f"uploads/comprobantes/{nombre}"
+            pedido.operation_code = codigo
+            pedido.payment_status = PAGO_VALIDADO
+            pedido.payment_validated_by = owner.username
+            pedido.payment_validated_at = datetime.now(timezone.utc)
+
+        faltantes = _faltantes(db, pedido.items, excluir_pedido_id=pedido.id)
+        if faltantes:
+            # El pago queda validado, no se confirma ni se reserva (HU024 #4 / HU017).
+            db.commit()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "message": "Pago validado, pero falta stock: " + " | ".join(f["mensaje"] for f in faltantes),
+                    "pagoValidado": True,
+                    "faltantes": faltantes,
+                },
+            )
+        pedido.status = ESTADO_CONFIRMADO
+        db.commit()
+    except HTTPException:
+        raise
     except Exception:
         db.rollback()
         raise
@@ -257,16 +354,10 @@ def editar_pedido(
     return _serializar(pedido)
 
 
-@router.post("/validar-stock")
-def validar_disponibilidad_stock(
-    payload: PedidoCreate,
-    db: Annotated[Session, Depends(get_db)],
-    _: Annotated[User, Depends(get_current_user)],
-):
-    """HU015 y HU017: Validar disponibilidad de stock y devolver alerta detallada de faltantes (HTTP 409)."""
-    items = _construir_items(db, payload.items)
+def _faltantes(db: Session, items: list[PedidoItem], excluir_pedido_id: int | None = None) -> list[dict]:
+    """HU015 y HU017: disponible = En Almacén − reservado; devuelve el detalle de cada faltante."""
     necesario = necesidades(items)
-    reservado = stock_reservado(db)
+    reservado = stock_reservado(db, excluir_pedido_id=excluir_pedido_id)
     insumos = db.scalars(select(Insumo).where(Insumo.id.in_(necesario))).all()
     por_id = {i.id: i for i in insumos}
 
@@ -289,7 +380,17 @@ def validar_disponibilidad_stock(
                     "mensaje": f"Falta: {nombre} — {faltante} {unidad} (Disponible: {disponible} {unidad} / Requerido: {requerido} {unidad})",
                 }
             )
+    return faltantes
 
+
+@router.post("/validar-stock")
+def validar_disponibilidad_stock(
+    payload: PedidoCreate,
+    db: Annotated[Session, Depends(get_db)],
+    _: Annotated[User, Depends(get_current_user)],
+):
+    """HU015 y HU017: Validar disponibilidad de stock y devolver alerta detallada de faltantes (HTTP 409)."""
+    faltantes = _faltantes(db, _construir_items(db, payload.items))
     if faltantes:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

@@ -9,3 +9,6 @@ htmlcov/
 .idea/
 .vscode/
 .DS_Store
+
+# Comprobantes de pago subidos (HU024)
+uploads/
