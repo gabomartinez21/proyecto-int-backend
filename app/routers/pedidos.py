@@ -1,4 +1,5 @@
 import json
+from datetime import date
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -9,26 +10,34 @@ from app.database import get_db
 from app.deps import get_current_user
 from app.models import Insumo, MovimientoStock, Pedido, PedidoItem, Producto, User
 from app.schemas import PedidoCreate, PedidoStatusUpdate, PedidoUpdate
-from app.stock import necesidades, stock_reservado
+from app.stock import ESTADO_CONFIRMADO, necesidades, stock_reservado
 
 router = APIRouter(prefix="/api/pedidos", tags=["pedidos"])
 
-CANALES_VALIDOS = {"WhatsApp", "Instagram", "Directo"}
-TRANSICIONES_PERMITIDAS: dict[str, set[str]] = {
-    "Pendiente": {"Confirmado", "Cancelado"},
-    "Confirmado": {"Entregado", "Cancelado"},
-    "Entregado": set(),
-    "Cancelado": set(),
+CANALES = ["WhatsApp", "Instagram", "Directo"]
+ESTADO_PENDIENTE = "Pendiente"
+ESTADO_ENTREGADO = "Entregado"
+ESTADO_CANCELADO = "Cancelado"
+ESTADOS = [ESTADO_PENDIENTE, ESTADO_CONFIRMADO, ESTADO_ENTREGADO, ESTADO_CANCELADO]
+TRANSICIONES: dict[str, set[str]] = {
+    ESTADO_PENDIENTE: {ESTADO_CONFIRMADO, ESTADO_CANCELADO},
+    ESTADO_CONFIRMADO: {ESTADO_ENTREGADO, ESTADO_CANCELADO},
 }
+EDITABLES = {ESTADO_PENDIENTE, ESTADO_CONFIRMADO}
 
 
 def _bad_request(detail: str) -> HTTPException:
     return HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=detail)
 
 
+def _product_id_out(valor: str) -> int | str:
+    # Los pedidos antiguos (de antes de migrar productos) pueden tener ids no numéricos.
+    return int(valor) if valor.isdigit() else valor
+
+
 def _serializar(pedido: Pedido) -> dict:
     return {
-        "id": pedido.id,
+        "id": str(pedido.id),
         "number": pedido.number,
         "customer": pedido.customer,
         "date": pedido.date,
@@ -38,7 +47,7 @@ def _serializar(pedido: Pedido) -> dict:
         "created": pedido.created.isoformat(),
         "items": [
             {
-                "productId": int(i.product_id) if str(i.product_id).isdigit() else i.product_id,
+                "productId": _product_id_out(i.product_id),
                 "name": i.name,
                 "price": i.price,
                 "quantity": i.quantity,
@@ -53,7 +62,7 @@ def _construir_items(db: Session, payload_items: list) -> list[PedidoItem]:
     if not payload_items:
         raise _bad_request("Agrega al menos un producto.")
 
-    ids = [it.productId for it in payload_items]
+    ids = {it.productId for it in payload_items}
     productos = db.scalars(
         select(Producto).options(selectinload(Producto.recipe)).where(Producto.id.in_(ids))
     ).all()
@@ -94,7 +103,7 @@ def crear_pedido(
     db: Annotated[Session, Depends(get_db)],
     _: Annotated[User, Depends(get_current_user)],
 ):
-    if payload.channel not in CANALES_VALIDOS:
+    if payload.channel not in CANALES:
         raise _bad_request("Canal inválido.")
 
     items = _construir_items(db, payload.items)
@@ -107,7 +116,7 @@ def crear_pedido(
         date=payload.date,
         channel=payload.channel,
         notes=payload.notes,
-        status="Pendiente",
+        status=ESTADO_PENDIENTE,
         items=items,
     )
     db.add(pedido)
@@ -116,9 +125,14 @@ def crear_pedido(
     return _serializar(pedido)
 
 
-def _confirmar(db: Session, pedido: Pedido) -> None:
+def _confirmar(
+    db: Session,
+    pedido: Pedido,
+    items: list[PedidoItem] | None = None,
+    mensaje: str = "Stock insuficiente: {nombre}. Revisa la lista de compras.",
+) -> None:
     """Verifica que el stock libre (stock - reservado por otros confirmados) alcance."""
-    necesario = necesidades(pedido.items)
+    necesario = necesidades(pedido.items if items is None else items)
     if not necesario:
         return
     reservado = stock_reservado(db, excluir_pedido_id=pedido.id)
@@ -131,7 +145,7 @@ def _confirmar(db: Session, pedido: Pedido) -> None:
         disponible = (insumo.stock if insumo else 0.0) - reservado.get(insumo_id, 0.0)
         if round(disponible - cantidad, 6) < 0:
             nombre = insumo.name if insumo else f"#{insumo_id}"
-            raise _bad_request(f"Stock insuficiente: {nombre}. Revisa la lista de compras.")
+            raise _bad_request(mensaje.format(nombre=nombre))
 
 
 def _entregar(db: Session, pedido: Pedido) -> None:
@@ -163,6 +177,15 @@ def _entregar(db: Session, pedido: Pedido) -> None:
         )
 
 
+def _obtener_para_actualizar(db: Session, pedido_id: int) -> Pedido:
+    pedido = db.scalar(
+        select(Pedido).options(selectinload(Pedido.items)).where(Pedido.id == pedido_id).with_for_update()
+    )
+    if not pedido:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pedido no encontrado")
+    return pedido
+
+
 @router.put("/{pedido_id}/estado")
 def cambiar_estado(
     pedido_id: int,
@@ -171,23 +194,25 @@ def cambiar_estado(
     _: Annotated[User, Depends(get_current_user)],
 ):
     """HU012, HU014 y HU016: Cambiar estado, reservar, descontar o cancelar liberando reservas."""
-    pedido = db.scalar(
-        select(Pedido).options(selectinload(Pedido.items)).where(Pedido.id == pedido_id)
-    )
-    if not pedido:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pedido no encontrado")
+    pedido = _obtener_para_actualizar(db, pedido_id)
 
-    destino = payload.status
-    if destino not in TRANSICIONES_PERMITIDAS.get(pedido.status, set()):
+    nuevo = payload.status
+    if nuevo not in ESTADOS:
+        raise _bad_request("Estado inválido.")
+    if nuevo not in TRANSICIONES.get(pedido.status, set()):
         raise _bad_request("Cambio de estado no permitido.")
 
-    if destino == "Confirmado":
-        _confirmar(db, pedido)
-    elif destino == "Entregado":
-        _entregar(db, pedido)
+    try:
+        if nuevo == ESTADO_CONFIRMADO:
+            _confirmar(db, pedido)
+        elif nuevo == ESTADO_ENTREGADO:
+            _entregar(db, pedido)
+        pedido.status = nuevo
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
-    pedido.status = destino
-    db.commit()
     db.refresh(pedido)
     return _serializar(pedido)
 
@@ -200,42 +225,34 @@ def editar_pedido(
     _: Annotated[User, Depends(get_current_user)],
 ):
     """HU013: Editar pedido antes de preparación."""
-    pedido = db.scalar(
-        select(Pedido).options(selectinload(Pedido.items)).where(Pedido.id == pedido_id)
-    )
-    if not pedido:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Pedido no encontrado")
+    pedido = _obtener_para_actualizar(db, pedido_id)
 
-    if pedido.status not in {"Pendiente", "Confirmado"}:
-        raise _bad_request(
-            "No se puede editar el pedido porque ya fue entregado o cancelado."
-        )
-    if payload.channel not in CANALES_VALIDOS:
+    if pedido.status not in EDITABLES:
+        raise _bad_request("No se puede editar el pedido porque ya fue entregado o cancelado.")
+    if payload.channel not in CANALES:
         raise _bad_request("Canal inválido.")
+    # Se permite conservar la fecha original aunque ya haya pasado; una fecha nueva no puede ser pasada.
+    if payload.date != pedido.date and payload.date < date.today().isoformat():
+        raise _bad_request("La fecha de entrega no puede ser anterior a hoy.")
 
     nuevos_items = _construir_items(db, payload.items)
 
-    if pedido.status == "Confirmado":
-        necesario = necesidades(nuevos_items)
-        reservado = stock_reservado(db, excluir_pedido_id=pedido.id)
-        insumos = db.scalars(select(Insumo).where(Insumo.id.in_(necesario))).all()
-        por_id = {i.id: i for i in insumos}
-        for insumo_id, cantidad in necesario.items():
-            insumo = por_id.get(insumo_id)
-            disponible = (insumo.stock if insumo else 0.0) - reservado.get(insumo_id, 0.0)
-            if round(disponible - cantidad, 6) < 0:
-                nombre = insumo.name if insumo else f"#{insumo_id}"
-                raise _bad_request(f"Stock insuficiente para editar: {nombre}.")
+    try:
+        if pedido.status == ESTADO_CONFIRMADO:
+            _confirmar(db, pedido, nuevos_items, "Stock insuficiente para editar: {nombre}.")
 
-    pedido.customer = payload.customer
-    pedido.date = payload.date
-    pedido.channel = payload.channel
-    pedido.notes = payload.notes
-    pedido.items.clear()
-    db.flush()
-    pedido.items.extend(nuevos_items)
+        pedido.customer = payload.customer
+        pedido.date = payload.date
+        pedido.channel = payload.channel
+        pedido.notes = payload.notes
+        pedido.items.clear()
+        db.flush()
+        pedido.items.extend(nuevos_items)
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
 
-    db.commit()
     db.refresh(pedido)
     return _serializar(pedido)
 

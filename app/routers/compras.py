@@ -9,7 +9,7 @@ from app.database import get_db
 from app.deps import get_current_user, require_owner
 from app.models import Insumo, MovimientoStock, Pedido, User
 from app.schemas import CompraConfirmarItem, InsumoOut
-from app.stock import necesidades
+from app.stock import ESTADO_CONFIRMADO, necesidades
 
 router = APIRouter(prefix="/api/compras", tags=["compras"])
 
@@ -18,15 +18,24 @@ router = APIRouter(prefix="/api/compras", tags=["compras"])
 def generar_lista_semanal(
     db: Annotated[Session, Depends(get_db)],
     _: Annotated[User, Depends(get_current_user)],
-    fecha_inicio: str = Query(default_factory=lambda: date.today().isoformat()),
-    fecha_fin: str = Query(default_factory=lambda: (date.today() + timedelta(days=6)).isoformat()),
+    inicio: Annotated[date | None, Query(alias="fecha_inicio")] = None,
+    fin: Annotated[date | None, Query(alias="fecha_fin")] = None,
 ):
     """HU021 y HU022: Generar lista de compra semanal automática con costo estimado."""
+    inicio = inicio or date.today()
+    fin = fin or inicio + timedelta(days=6)
+    if fin < inicio:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="fecha_fin no puede ser anterior a fecha_inicio.",
+        )
+    # Pedido.date se guarda como texto ISO (YYYY-MM-DD), que se ordena igual que la fecha.
+    fecha_inicio, fecha_fin = inicio.isoformat(), fin.isoformat()
     pedidos_rango = db.scalars(
         select(Pedido)
         .options(selectinload(Pedido.items))
         .where(
-            Pedido.status.in_(["Pendiente", "Confirmado"]),
+            Pedido.status.in_(["Pendiente", ESTADO_CONFIRMADO]),
             Pedido.date >= fecha_inicio,
             Pedido.date <= fecha_fin,
         )
@@ -36,7 +45,7 @@ def generar_lista_semanal(
         select(Pedido)
         .options(selectinload(Pedido.items))
         .where(
-            Pedido.status == "Confirmado",
+            Pedido.status == ESTADO_CONFIRMADO,
             (Pedido.date < fecha_inicio) | (Pedido.date > fecha_fin),
         )
     ).all()

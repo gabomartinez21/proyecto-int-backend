@@ -195,3 +195,69 @@ def test_no_se_puede_retirar_stock_reservado(client, employee_headers, owner_hea
     res = client.post(url, json={"kind": "salida", "quantity": 4, "note": "Merma"}, headers=owner_headers)
     assert res.status_code == 200
     assert res.json()["stock"] == 6.0
+
+
+# --- Sprint 3: edición de pedidos (HU013) y validación de stock (HU015/HU017) ---
+
+
+def editar(client, headers, pedido_id, product_id, quantity, **extra):
+    body = body_pedido([{"productId": product_id, "quantity": quantity}]) | extra
+    return client.put(f"/api/pedidos/{pedido_id}", json=body, headers=headers)
+
+
+def test_editar_pedido_pendiente(client, employee_headers, catalogo):
+    pedido = crear_pedido(client, employee_headers, catalogo["torta"]["id"])
+    res = editar(client, employee_headers, pedido["id"], catalogo["torta"]["id"], 3, customer="  Luis Pérez ", notes=" sin azúcar ")
+    assert res.status_code == 200, res.text
+    data = res.json()
+    assert data["id"] == pedido["id"]
+    assert data["customer"] == "Luis Pérez"
+    assert data["notes"] == "sin azúcar"
+    assert [i["quantity"] for i in data["items"]] == [3]
+
+
+def test_editar_pedido_confirmado_valida_stock(client, employee_headers, catalogo):
+    tid = catalogo["torta"]["id"]
+    pedido = crear_pedido(client, employee_headers, tid, quantity=2)  # 4 kg
+    cambiar_estado(client, employee_headers, pedido["id"], "Confirmado")
+
+    assert editar(client, employee_headers, pedido["id"], tid, 5).status_code == 200  # 10 kg: alcanza
+    res = editar(client, employee_headers, pedido["id"], tid, 6)  # 12 kg: no alcanza
+    assert res.status_code == 400
+    assert "Harina" in res.json()["detail"]
+    actual = next(p for p in client.get("/api/pedidos", headers=employee_headers).json() if p["id"] == pedido["id"])
+    assert actual["items"][0]["quantity"] == 5
+
+
+def test_no_se_edita_pedido_entregado_o_cancelado(client, employee_headers, catalogo):
+    tid = catalogo["torta"]["id"]
+    pedido = crear_pedido(client, employee_headers, tid)
+    cambiar_estado(client, employee_headers, pedido["id"], "Cancelado")
+    assert editar(client, employee_headers, pedido["id"], tid, 1).status_code == 400
+
+
+def test_editar_pedido_inexistente(client, employee_headers, catalogo):
+    assert editar(client, employee_headers, 9999, catalogo["torta"]["id"], 1).status_code == 404
+
+
+def test_editar_conserva_fecha_pasada_pero_no_acepta_una_nueva(client, employee_headers, catalogo, db):
+    from app.models import Pedido
+
+    tid = catalogo["torta"]["id"]
+    pedido = crear_pedido(client, employee_headers, tid)
+    db.get(Pedido, int(pedido["id"])).date = "2020-01-01"
+    db.commit()
+
+    assert editar(client, employee_headers, pedido["id"], tid, 2, date="2020-01-01").status_code == 200
+    assert editar(client, employee_headers, pedido["id"], tid, 2, date="2020-01-02").status_code == 400
+
+
+def test_validar_stock_reporta_faltantes(client, employee_headers, catalogo):
+    tid = catalogo["torta"]["id"]
+    ok = client.post("/api/pedidos/validar-stock", json=body_pedido([{"productId": tid, "quantity": 5}]), headers=employee_headers)
+    assert ok.status_code == 200
+
+    res = client.post("/api/pedidos/validar-stock", json=body_pedido([{"productId": tid, "quantity": 6}]), headers=employee_headers)
+    assert res.status_code == 409
+    faltante = res.json()["detail"]["faltantes"][0]
+    assert (faltante["requerido"], faltante["disponible"], faltante["faltante"]) == (12, 10, 2)
